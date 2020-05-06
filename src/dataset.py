@@ -1,5 +1,5 @@
 from util import Json
-from const import DIR_DATASET
+from const import DIR_DATASET, DIR_ENTITYSET
 
 
 class Candidate:
@@ -17,6 +17,13 @@ class Mention:
         self.candidates = [Candidate(i, p, n) for i, p, n in m_dict['candidates']]
         g_id, g_prob, g_name = m_dict['gt']
         self.gt = Candidate(g_id, g_prob, g_name)
+
+
+class Document:
+    def __init__(self, d_dict):
+        self.title = d_dict['title']
+        self.sections = d_dict['sections']
+        self.categories = d_dict['categories']
 
 
 class Dataset:
@@ -48,3 +55,24 @@ class Dataset:
         recall = true_pos / len(gold_cids)
         f1 = 2 * precision * recall / (precision + recall)
         return f1
+
+
+class KnowledgeBase:
+    entity_file = {
+        'train': DIR_ENTITYSET / 'id2entity_aida.json',
+        'aidaA': DIR_ENTITYSET / 'id2entity_aida.json',
+        'aidaB': DIR_ENTITYSET / 'id2entity_aida.json',
+        'msnbc': DIR_ENTITYSET / 'id2entity_msnbc.json',
+        'ace': DIR_ENTITYSET / 'id2entity_ace.json',
+        'aquaint': DIR_ENTITYSET / 'id2entity_aquaint.json',
+    }
+
+    def __init__(self, filepath):
+        self.documents = dict()
+        for id, doc in Json.loadf(filepath).items():
+            self.documents[id] = Document(doc)
+
+    @classmethod
+    def get(cls, dsname):
+        path = cls.entity_file[dsname]
+        return KnowledgeBase(path)
