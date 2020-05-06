@@ -1,23 +1,10 @@
 import random
 import Levenshtein
-import string
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.feature_extraction.text import CountVectorizer
-from nltk.corpus import stopwords
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import math
 import numpy as np
-
-stopwords = stopwords.words('english')
-
-
-def clean_string(text):
-    text = ''.join([word for word in text if word not in string.punctuation])
-    text = text.lower()
-    text = ' '.join([word for word in text.split() if word not in stopwords])
-    return text
+import pickle
 
 
 def cosine_sim_vectors(vec1, vec2):
@@ -57,92 +44,131 @@ class PriorModel:
 
 # 1. prior probability
 # 2. distance between surface name and candidate name (Levenshtein distance)
-# 3 & 4. similarity between context and candidate name (cosine similarity)
+# 3 & 4. similarity between context and candidate name (common words)
 class SupModel:
     def __init__(self):
-        super(SupModel, self).__init__()
-        self.lrate = 0.01
-        self.in_size = 4
-        self.out_size = 2
-
-        self.features = nn.Linear(self.in_size, self.out_size)
-
-        self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = optim.SGD(self.features.parameters(), self.lrate)
-        self.classifier = nn.Softmax()
-
-    def get_parameters(self):
-        return self.features.parameters()
-
-    def forward(self, x):
-        return self.features(x)
-
-    def step(self, x, y):
-        self.optimizer.zero_grad()
-
-        # forward
-        y_hat = self.forward(x)
-
-        # loss
-        loss = self.criterion(y_hat, y)
-        L = loss.item()
-
-        # backward
-        loss.backward()
-        self.optimizer.step()
-
-        return L
+        self.logistic_reg = LogisticRegression()
 
     def fit(self, dataset):
-        # make tensors
         train_set = []
         train_labels = []
         for mention in dataset.mentions:
-            idx = 1
-            sentences = [mention.contexts[0], mention.contexts[1]]
+            context_1 = [x.lower().strip() for x in mention.contexts[0]]
+            context_2 = [x.lower().strip() for x in mention.contexts[1]]
             for candidate in mention.candidates:
-                sentences.append(candidate.name)
-            cleaned = list(map(clean_string, sentences))
-            vectorizer = CountVectorizer().fit_transform(cleaned)
-            vectors = vectorizer.toarray()
-            for candidate in mention.candidates:
-                idx += 1
+                words = candidate.name.lower().split()
+                context_sim_1 = sum([1 if x.strip() in context_1 else 0 for x in words])
+                context_sim_2 = sum([1 if x.strip() in context_2 else 0 for x in words])
                 train_set.append([candidate.prob, math.exp(-Levenshtein.distance(candidate.name, mention.surface)),
-                                  cosine_sim_vectors(vectors[0], vectors[idx]),
-                                  cosine_sim_vectors(vectors[1], vectors[idx])])
+                                  context_sim_1 / len(words), context_sim_2 / len(words)])
                 train_labels.append(1 if mention.gt.id == candidate.id else 0)
-        train_set = torch.tensor(train_set, dtype=torch.float32)
-        train_labels = torch.tensor(train_labels, dtype=torch.int64)
+        train_set = np.array(train_set)
+        train_labels = np.array(train_labels)
 
-        # train
-        n_iter = 2000
-        batch_size = 200
-        N = train_set.shape[0]
-        for batch in range(n_iter):
-            # get batch data
-            idx = torch.randperm(N)
-            x_batch = train_set[idx[:batch_size]]
-            y_batch = train_labels[idx[:batch_size]]
-            loss = self.step(x_batch, y_batch)
-            print(loss)
+        self.logistic_reg.fit(train_set, train_labels)
 
     def predict(self, dataset):
         pred_cids = []
         for mention in dataset.mentions:
-            idx = 1
-            sentences = [mention.contexts[0], mention.contexts[1]]
+            dev_set = []
+            context_1 = [x.lower().strip() for x in mention.contexts[0]]
+            context_2 = [x.lower().strip() for x in mention.contexts[1]]
             for candidate in mention.candidates:
-                sentences.append(candidate.name)
-            cleaned = list(map(clean_string, sentences))
-            vectorizer = CountVectorizer().fit_transform(cleaned)
-            vectors = vectorizer.toarray()
+                words = candidate.name.lower().split()
+                context_sim_1 = sum([1 if x.strip() in context_1 else 0 for x in words])
+                context_sim_2 = sum([1 if x.strip() in context_2 else 0 for x in words])
+                dev_set.append([candidate.prob, math.exp(-Levenshtein.distance(candidate.name, mention.surface)),
+                                context_sim_1 / len(words), context_sim_2 / len(words)])
+            dev_set = np.array(dev_set)
+            if mention.candidates:
+                pred = self.logistic_reg.predict_proba(dev_set)
+                pred_cids.append(mention.candidates[np.argmax(pred[:, 1])].id)
+            else:
+                pred_cids.append('NIL')
+        return pred_cids
+
+
+# 1. prior probability (1 D)
+# 2. distance between surface name and candidate name (1 D)
+# 3. similarity between context and candidate name (2 D)
+# 4. candidate entity embedding (300 D)
+# 5. sum of context word embeddings (300 D)
+# 6. cosine similarity between the two embedding (1 D)
+class SupModelWithEmbedding:
+    def __init__(self):
+        self.logistic_reg = LogisticRegression(max_iter=200)
+
+        with open('../data/embeddings/ent2embed.pk', 'rb') as rf:
+            self.ent2embed = pickle.load(rf)
+        with open('../data/embeddings/word2embed.pk', 'rb') as rf:
+            self.word2embed = pickle.load(rf)
+
+    def fit(self, dataset):
+        train_set = []
+        train_labels = []
+        for mention in dataset.mentions:
+            context_1 = [x.lower().strip() for x in mention.contexts[0]]
+            context_2 = [x.lower().strip() for x in mention.contexts[1]]
+            word_emb = np.zeros((300,))
+            for word in mention.contexts[0]:
+                word_emb += self.word2embed.get(word, np.zeros(300,))
+            for word in mention.contexts[1]:
+                word_emb += self.word2embed.get(word, np.zeros(300,))
+
+            for candidate in mention.candidates:
+                feat = [candidate.prob,
+                        math.exp(-Levenshtein.distance(candidate.name, mention.surface))]
+                words = candidate.name.lower().split()
+                context_sim_1 = sum([1 if x.strip() in context_1 else 0 for x in words])
+                context_sim_2 = sum([1 if x.strip() in context_2 else 0 for x in words])
+                feat.append(context_sim_1 / len(words))
+                feat.append(context_sim_2 / len(words))
+                ent = '_'.join(candidate.name.split(' '))
+                ent_emb = self.ent2embed[ent]
+                feat.extend(ent_emb)
+                feat.extend(word_emb)
+                feat.append(cosine_sim_vectors(word_emb, ent_emb))
+
+                train_set.append(feat)
+                train_labels.append(1 if mention.gt.id == candidate.id else 0)
+
+        train_set = np.array(train_set)
+        train_labels = np.array(train_labels)
+
+        self.logistic_reg.fit(train_set, train_labels)
+
+    def predict(self, dataset):
+        pred_cids = []
+        for mention in dataset.mentions:
+            context_1 = [x.lower().strip() for x in mention.contexts[0]]
+            context_2 = [x.lower().strip() for x in mention.contexts[1]]
+            word_emb = np.zeros(300,)
+            for word in mention.contexts[0]:
+                word_emb += self.word2embed.get(word, np.zeros(300,))
+            for word in mention.contexts[1]:
+                word_emb += self.word2embed.get(word, np.zeros(300,))
+
             dev_set = []
             for candidate in mention.candidates:
-                idx += 1
-                dev_set.append([candidate.prob, math.exp(-Levenshtein.distance(candidate.name, mention.surface)),
-                                cosine_sim_vectors(vectors[0], vectors[idx]),
-                                cosine_sim_vectors(vectors[1], vectors[idx])])
-            dev_set = torch.tensor(dev_set, dtype=torch.float32)
-            pred_cids.append(mention.candidates[np.argmax(
-                self.forward(dev_set).detach().numpy()[:, 1])].id if mention.candidates else 'NIL')
+                feat = [candidate.prob,
+                        math.exp(-Levenshtein.distance(candidate.name, mention.surface))]
+                words = candidate.name.lower().split()
+                context_sim_1 = sum([1 if x.strip() in context_1 else 0 for x in words])
+                context_sim_2 = sum([1 if x.strip() in context_2 else 0 for x in words])
+                feat.append(context_sim_1 / len(words))
+                feat.append(context_sim_2 / len(words))
+                ent = '_'.join(candidate.name.split(' '))
+                ent_emb = self.ent2embed.get(ent, np.zeros(300,))
+                feat.extend(ent_emb)
+                feat.extend(word_emb)
+                feat.append(cosine_sim_vectors(word_emb, ent_emb))
+
+                dev_set.append(feat)
+
+            dev_set = np.array(dev_set)
+            if mention.candidates:
+                pred = self.logistic_reg.predict_proba(dev_set)
+                pred_cids.append(mention.candidates[np.argmax(pred[:, 1])].id)
+            else:
+                pred_cids.append('NIL')
         return pred_cids
